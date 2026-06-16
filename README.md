@@ -22,9 +22,10 @@ There is also a small wordplay: because the uppercase **I** and lowercase **l** 
 * Automatically detect and crop the face from the reference photo
 * Match the reference face inside the video
 * Blur the matched person in the output video
+* Preview the processed video directly in the web app when the output format is browser-compatible
 * Download the processed video
 * Adjustable advanced settings for matching, tracking, blur strength, and detection interval
-* Clean semi-monochrome Streamlit interface
+* Clean interface
 
 ## Tech Stack
 
