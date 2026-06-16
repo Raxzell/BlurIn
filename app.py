@@ -1,8 +1,10 @@
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
 import numpy as np
 import streamlit as st
 
@@ -276,7 +278,34 @@ def save_uploaded_video(uploaded_file):
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_video:
         temp_video.write(uploaded_file.read())
         return temp_video.name
+def convert_to_browser_compatible_mp4(input_path, output_path):
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        input_path,
+        "-vcodec",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise ValueError("Video was processed, but conversion for browser preview failed.")
+
+    return output_path
 
 def crop_single_face(image_bgr, detector):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -736,11 +765,16 @@ if process_button:
                 f"Done. Processed {result['processed_frames']} frames and blurred the target in {result['detected_frames']} frames."
             )
 
-            with open(output_path, "rb") as output_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as browser_output:
+                browser_output_path = browser_output.name
+            
+            convert_to_browser_compatible_mp4(output_path, browser_output_path)
+            
+            with open(browser_output_path, "rb") as output_file:
                 output_bytes = output_file.read()
-
+            
             st.video(output_bytes)
-
+            
             st.download_button(
                 label="Download blurred video",
                 data=output_bytes,
