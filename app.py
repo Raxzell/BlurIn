@@ -278,6 +278,8 @@ def save_uploaded_video(uploaded_file):
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_video:
         temp_video.write(uploaded_file.read())
         return temp_video.name
+
+
 def convert_to_browser_compatible_mp4(input_path, output_path):
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
@@ -306,6 +308,7 @@ def convert_to_browser_compatible_mp4(input_path, output_path):
         raise ValueError("Video was processed, but conversion for browser preview failed.")
 
     return output_path
+
 
 def crop_single_face(image_bgr, detector):
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -345,6 +348,59 @@ def crop_single_face(image_bgr, detector):
     return cropped_face
 
 
+def detect_faces_in_frame(gray_frame, detector):
+    faces = detector.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.05,
+        minNeighbors=4,
+        minSize=(35, 35),
+    )
+
+    if len(faces) == 0:
+        return []
+
+    boxes = []
+
+    for x, y, w, h in faces:
+        boxes.append((int(x), int(y), int(x + w), int(y + h)))
+
+    boxes.sort(
+        key=lambda box: (box[2] - box[0]) * (box[3] - box[1]),
+        reverse=True,
+    )
+
+    return boxes
+
+
+def expand_box(box, frame_width, frame_height, padding):
+    x1, y1, x2, y2 = box
+
+    x1 = max(0, x1 - padding)
+    y1 = max(0, y1 - padding)
+    x2 = min(frame_width, x2 + padding)
+    y2 = min(frame_height, y2 + padding)
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return x1, y1, x2, y2
+
+
+def smooth_box(previous_box, current_box, alpha=0.72):
+    if previous_box is None:
+        return current_box
+
+    px1, py1, px2, py2 = previous_box
+    cx1, cy1, cx2, cy2 = current_box
+
+    x1 = int(alpha * px1 + (1 - alpha) * cx1)
+    y1 = int(alpha * py1 + (1 - alpha) * cy1)
+    x2 = int(alpha * px2 + (1 - alpha) * cx2)
+    y2 = int(alpha * py2 + (1 - alpha) * cy2)
+
+    return x1, y1, x2, y2
+
+
 def make_odd(value):
     value = int(value)
     return value if value % 2 == 1 else value + 1
@@ -364,38 +420,20 @@ def blur_region(frame, box, blur_strength):
     return frame
 
 
-def get_tracking_box(points, frame_width, frame_height, padding):
-    x_coords = points[:, 0]
-    y_coords = points[:, 1]
+def get_sift_match_score(reference_gray, candidate_gray, sift, flann, ratio_threshold):
+    if candidate_gray.size == 0:
+        return 0
 
-    x_min = max(0, int(np.min(x_coords)) - padding)
-    y_min = max(0, int(np.min(y_coords)) - padding)
-    x_max = min(frame_width, int(np.max(x_coords)) + padding)
-    y_max = min(frame_height, int(np.max(y_coords)) + padding)
+    kp_ref, des_ref = sift.detectAndCompute(reference_gray, None)
+    kp_candidate, des_candidate = sift.detectAndCompute(candidate_gray, None)
 
-    if x_max <= x_min or y_max <= y_min:
-        return None
+    if des_ref is None or des_candidate is None:
+        return 0
 
-    return x_min, y_min, x_max, y_max
+    if len(des_ref) < 2 or len(des_candidate) < 2:
+        return 0
 
-
-def detect_reference_in_frame(
-    curr_gray,
-    img_ref_gray,
-    sift,
-    flann,
-    kp_ref,
-    des_ref,
-    min_match_count,
-    ratio_threshold,
-    feature_params,
-):
-    kp_frame, des_frame = sift.detectAndCompute(curr_gray, None)
-
-    if des_frame is None or len(des_frame) < 2:
-        return None, None
-
-    matches = flann.knnMatch(des_ref, des_frame, k=2)
+    matches = flann.knnMatch(des_ref, des_candidate, k=2)
     good_matches = []
 
     for match_pair in matches:
@@ -407,50 +445,43 @@ def detect_reference_in_frame(
         if first_match.distance < ratio_threshold * second_match.distance:
             good_matches.append(first_match)
 
-    if len(good_matches) < min_match_count:
-        return None, None
+    return len(good_matches)
 
-    src_pts = np.float32(
-        [kp_ref[m.queryIdx].pt for m in good_matches]
-    ).reshape(-1, 1, 2)
 
-    dst_pts = np.float32(
-        [kp_frame[m.trainIdx].pt for m in good_matches]
-    ).reshape(-1, 1, 2)
+def choose_target_face(
+    gray_frame,
+    face_boxes,
+    img_ref_gray,
+    sift,
+    flann,
+    ratio_threshold,
+):
+    if len(face_boxes) == 0:
+        return None
 
-    homography, _ = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    if len(face_boxes) == 1:
+        return face_boxes[0]
 
-    if homography is None:
-        return None, None
+    best_box = None
+    best_score = -1
 
-    ref_h, ref_w = img_ref_gray.shape
+    for box in face_boxes:
+        x1, y1, x2, y2 = box
+        face_roi = gray_frame[y1:y2, x1:x2]
 
-    corners = np.float32(
-        [
-            [0, 0],
-            [0, ref_h - 1],
-            [ref_w - 1, ref_h - 1],
-            [ref_w - 1, 0],
-        ]
-    ).reshape(-1, 1, 2)
+        score = get_sift_match_score(
+            reference_gray=img_ref_gray,
+            candidate_gray=face_roi,
+            sift=sift,
+            flann=flann,
+            ratio_threshold=ratio_threshold,
+        )
 
-    detected_polygon = cv2.perspectiveTransform(corners, homography)
+        if score > best_score:
+            best_score = score
+            best_box = box
 
-    mask = np.zeros_like(curr_gray)
-    cv2.fillPoly(mask, [np.int32(detected_polygon)], 255)
-
-    tracking_points = cv2.goodFeaturesToTrack(
-        curr_gray,
-        mask=mask,
-        **feature_params,
-    )
-
-    if tracking_points is None:
-        return None, None
-
-    polygon_points = detected_polygon.reshape(-1, 2)
-
-    return polygon_points, tracking_points
+    return best_box
 
 
 def process_video(
@@ -461,8 +492,8 @@ def process_video(
     status_callback,
     min_match_count=10,
     min_track_points=5,
-    blur_strength=51,
-    padding=35,
+    blur_strength=71,
+    padding=45,
     detection_interval=12,
     ratio_threshold=0.7,
 ):
@@ -470,42 +501,16 @@ def process_video(
     img_ref_gray = crop_single_face(reference_image_bgr, detector)
 
     sift = cv2.SIFT_create()
-    kp_ref, des_ref = sift.detectAndCompute(img_ref_gray, None)
-
-    if des_ref is None or len(kp_ref) < min_match_count:
-        raise ValueError(
-            "Reference face has too few visual features. Use a clearer, sharper, front-facing face photo."
-        )
 
     flann_index_kdtree = 1
-
     index_params = dict(
         algorithm=flann_index_kdtree,
         trees=5,
     )
-
     search_params = dict(
         checks=50,
     )
-
     flann = cv2.FlannBasedMatcher(index_params, search_params)
-
-    feature_params = dict(
-        maxCorners=120,
-        qualityLevel=0.25,
-        minDistance=7,
-        blockSize=7,
-    )
-
-    lk_params = dict(
-        winSize=(15, 15),
-        maxLevel=2,
-        criteria=(
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-            10,
-            0.03,
-        ),
-    )
 
     cap = cv2.VideoCapture(video_path)
 
@@ -527,9 +532,11 @@ def process_video(
         cap.release()
         raise ValueError("Output video cannot be created on this system.")
 
-    mode = "DETECTION"
-    old_gray = None
-    p0 = None
+    smoothed_box = None
+    last_valid_box = None
+    missing_face_frames = 0
+    max_missing_face_frames = 5
+
     detected_frames = 0
     processed_frames = 0
 
@@ -541,69 +548,57 @@ def process_video(
 
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        should_detect = (
-            mode == "DETECTION"
-            or processed_frames % detection_interval == 0
+        face_boxes = detect_faces_in_frame(curr_gray, detector)
+
+        target_box = choose_target_face(
+            gray_frame=curr_gray,
+            face_boxes=face_boxes,
+            img_ref_gray=img_ref_gray,
+            sift=sift,
+            flann=flann,
+            ratio_threshold=ratio_threshold,
         )
 
-        if should_detect:
-            polygon_points, new_points = detect_reference_in_frame(
-                curr_gray=curr_gray,
-                img_ref_gray=img_ref_gray,
-                sift=sift,
-                flann=flann,
-                kp_ref=kp_ref,
-                des_ref=des_ref,
-                min_match_count=min_match_count,
-                ratio_threshold=ratio_threshold,
-                feature_params=feature_params,
+        if target_box is not None:
+            expanded_box = expand_box(
+                box=target_box,
+                frame_width=width,
+                frame_height=height,
+                padding=padding,
             )
 
-            if polygon_points is not None and new_points is not None:
-                box = get_tracking_box(
-                    polygon_points,
-                    width,
-                    height,
-                    padding,
+            if expanded_box is not None:
+                smoothed_box = smooth_box(
+                    previous_box=smoothed_box,
+                    current_box=expanded_box,
+                    alpha=0.72,
                 )
 
-                if box is not None:
-                    frame = blur_region(frame, box, blur_strength)
-                    detected_frames += 1
-                    p0 = new_points
-                    old_gray = curr_gray.copy()
-                    mode = "TRACKING"
+                last_valid_box = smoothed_box
+                missing_face_frames = 0
 
-        elif mode == "TRACKING" and old_gray is not None and p0 is not None:
-            p1, st, _ = cv2.calcOpticalFlowPyrLK(
-                old_gray,
-                curr_gray,
-                p0,
-                None,
-                **lk_params,
-            )
+                frame = blur_region(
+                    frame=frame,
+                    box=smoothed_box,
+                    blur_strength=blur_strength,
+                )
 
-            if p1 is None or st is None:
-                mode = "DETECTION"
+                detected_frames += 1
+
+        else:
+            missing_face_frames += 1
+
+            if last_valid_box is not None and missing_face_frames <= max_missing_face_frames:
+                frame = blur_region(
+                    frame=frame,
+                    box=last_valid_box,
+                    blur_strength=blur_strength,
+                )
+
+                detected_frames += 1
             else:
-                good_new = p1[st == 1]
-
-                if len(good_new) < min_track_points:
-                    mode = "DETECTION"
-                else:
-                    box = get_tracking_box(
-                        good_new,
-                        width,
-                        height,
-                        padding,
-                    )
-
-                    if box is not None:
-                        frame = blur_region(frame, box, blur_strength)
-                        detected_frames += 1
-
-                    old_gray = curr_gray.copy()
-                    p0 = good_new.reshape(-1, 1, 2)
+                smoothed_box = None
+                last_valid_box = None
 
         out.write(frame)
         processed_frames += 1
@@ -697,7 +692,7 @@ with st.expander("Advanced settings"):
         "Blur strength",
         min_value=21,
         max_value=101,
-        value=51,
+        value=71,
         step=2,
     )
 
@@ -705,7 +700,7 @@ with st.expander("Advanced settings"):
         "Blur padding",
         min_value=10,
         max_value=90,
-        value=35,
+        value=45,
     )
 
     detection_interval = st.slider(
@@ -733,6 +728,7 @@ if process_button:
     else:
         temp_video_path = None
         output_path = None
+        browser_output_path = None
 
         try:
             reference_image = decode_uploaded_image(reference_upload)
@@ -767,14 +763,14 @@ if process_button:
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as browser_output:
                 browser_output_path = browser_output.name
-            
+
             convert_to_browser_compatible_mp4(output_path, browser_output_path)
-            
+
             with open(browser_output_path, "rb") as output_file:
                 output_bytes = output_file.read()
-            
+
             st.video(output_bytes)
-            
+
             st.download_button(
                 label="Download blurred video",
                 data=output_bytes,
@@ -786,6 +782,6 @@ if process_button:
             st.error(str(error))
 
         finally:
-            for path in [temp_video_path, output_path]:
+            for path in [temp_video_path, output_path, browser_output_path]:
                 if path and os.path.exists(path):
                     os.remove(path)
