@@ -25,7 +25,7 @@ There is also a small wordplay: because the uppercase **I** and lowercase **l** 
 * Preview the processed video directly in the web app when the output format is browser-compatible
 * Download the processed video
 * Adjustable advanced settings for matching, tracking, blur strength, and detection interval
-* Clean interface
+* Clean Streamlit interface
 
 ## Tech Stack
 
